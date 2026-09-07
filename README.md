@@ -335,7 +335,7 @@ Palalloc is benchmarked against the standard `malloc` allocator using the same s
 
 | Allocator    | Average Time | Relative Performance |
 | :----------- | -----------: | -------------------: |
-| **Palalloc** |    **19.07** |     **3.09× faster** |
+| **Palalloc** |    **19.07** |     **2.98× faster** |
 | `malloc`     |        59.02 |                1.00× |
 
 > **Result:** Palalloc achieves approximately **3.09× lower average execution time** than `malloc` for this workload.
