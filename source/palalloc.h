@@ -48,17 +48,17 @@ uint32_t pal_nextPow2 (uint32_t x)
     return 1 << (32 - pal_clz(x));
 }
 
-void pal_ensurePoolCap (Palalloc* poolObject)
+void pal_ensureClassCap (Palalloc* poolObject)
 {
-    if (poolObject->poolCount <= poolObject->poolCap)
+    if (poolObject->classCount <= poolObject->classCap)
         return;
         
-    poolObject->poolCap = pal_max(poolObject->poolCount, poolObject->poolCap * 2);
+    poolObject->classCap = pal_max(poolObject->classCount, poolObject->classCap * 2);
 
-    uint8_t** headsBuffer = (uint8_t**)malloc(poolObject->poolCap * sizeof(uint8_t*));
-    uint32_t* sizeClassesBuffer = (uint32_t*)malloc(poolObject->poolCap * sizeof(uint32_t));
+    uint8_t** headsBuffer = (uint8_t**)malloc(poolObject->classCap * sizeof(uint8_t*));
+    uint32_t* sizeClassesBuffer = (uint32_t*)malloc(poolObject->classCap * sizeof(uint32_t));
     
-    for (int i = 0; i < poolObject->poolCount - 1; ++i)
+    for (int i = 0; i < poolObject->classCount - 1; ++i)
     {
         headsBuffer[i] = poolObject->heads[i];
         sizeClassesBuffer[i] = poolObject->sizeClasses[i];
@@ -71,16 +71,16 @@ void pal_ensurePoolCap (Palalloc* poolObject)
     poolObject->sizeClasses = sizeClassesBuffer;
 }
 
-void pal_ensureClassCap (Palalloc* poolObject)
+void pal_ensurePoolCap (Palalloc* poolObject)
 {
-    if (poolObject->classCount <= poolObject->classCap)
+    if (poolObject->poolCount <= poolObject->poolCap)
         return;
 
-    poolObject->classCap = pal_max(poolObject->classCount, poolObject->classCap * 2);
+    poolObject->poolCap = pal_max(poolObject->poolCount, poolObject->poolCap * 2);
     
-    uint8_t** poolsBuffer = (uint8_t**)malloc(poolObject->classCap * sizeof(uint8_t*));
+    uint8_t** poolsBuffer = (uint8_t**)malloc(poolObject->poolCap * sizeof(uint8_t*));
 
-    for (int i = 0; i < poolObject->classCount - 1; ++i)
+    for (int i = 0; i < poolObject->poolCount - 1; ++i)
     {
         poolsBuffer[i] = poolObject->pools[i];
     }
@@ -92,7 +92,7 @@ void pal_ensureClassCap (Palalloc* poolObject)
 
 uint32_t pal_findIdx (Palalloc* poolObject, uint32_t idx, uint32_t size)
 {
-    for (; idx < poolObject->poolCount; ++idx)
+    for (; idx < poolObject->classCount; ++idx)
     {
         if (size == poolObject->sizeClasses[idx])
             break;
@@ -104,12 +104,12 @@ uint32_t pal_findIdx (Palalloc* poolObject, uint32_t idx, uint32_t size)
 void pal_newPool (Palalloc* poolObject, uint8_t** resPtr, uint32_t size, uint32_t idx)
 {
     uint32_t poolSize = pal_max(4096, size * 16);
-    ++poolObject->classCount;
-    pal_ensureClassCap(poolObject);
-    poolObject->pools[poolObject->classCount - 1] = (uint8_t*)malloc(poolSize);
+    ++poolObject->poolCount;
+    pal_ensurePoolCap(poolObject);
+    poolObject->pools[poolObject->poolCount - 1] = (uint8_t*)malloc(poolSize);
 
-    *resPtr = (uint8_t*)poolObject->pools[poolObject->classCount - 1];
-    poolObject->heads[idx] = (uint8_t*)(poolObject->pools[poolObject->classCount - 1] + size);
+    *resPtr = (uint8_t*)poolObject->pools[poolObject->poolCount - 1];
+    poolObject->heads[idx] = (uint8_t*)(poolObject->pools[poolObject->poolCount - 1] + size);
     poolObject->sizeClasses[idx] = size;
     
     for (int i = 0; i < poolSize - size; i += size)
@@ -117,7 +117,7 @@ void pal_newPool (Palalloc* poolObject, uint8_t** resPtr, uint32_t size, uint32_
         *(uint8_t**)(poolObject->heads[idx] + i) = (uint8_t*)(poolObject->heads[idx] + i + size);
     }
 
-    *(uint8_t**)(poolObject->pools[poolObject->classCount - 1] + poolSize - size) = NULL;
+    *(uint8_t**)(poolObject->pools[poolObject->poolCount - 1] + poolSize - size) = NULL;
 }
 
 void pal_split (Palalloc* poolObject, uint8_t** resPtr, uint32_t idx, uint32_t size)
@@ -132,7 +132,7 @@ void pal_split (Palalloc* poolObject, uint8_t** resPtr, uint32_t idx, uint32_t s
         nextSize <<= 1;
         nextIdx = pal_findIdx(poolObject, ++nextIdx, nextSize);
 
-        if (nextIdx >= poolObject->poolCount)
+        if (nextIdx >= poolObject->classCount)
             return;
 
         if (poolObject->heads[nextIdx] != NULL)
@@ -140,12 +140,12 @@ void pal_split (Palalloc* poolObject, uint8_t** resPtr, uint32_t idx, uint32_t s
             *resPtr = poolObject->heads[nextIdx];
             poolObject->heads[idx] = poolObject->heads[nextIdx] + size;
             poolObject->heads[nextIdx] = *(uint8_t**)poolObject->heads[nextIdx];
-            int supoolCount = 0;
-            for (int i = 1; i < split - 1; ++i, supoolCount += size)
+            int sumPoolCount = 0;
+            for (int i = 1; i < split - 1; ++i, sumPoolCount += size)
             {
-                *(uint8_t**)(poolObject->heads[idx] + supoolCount) = (uint8_t*)(poolObject->heads[idx] + supoolCount + size);
+                *(uint8_t**)(poolObject->heads[idx] + sumPoolCount) = (uint8_t*)(poolObject->heads[idx] + sumPoolCount + size);
             }
-            *(uint8_t**)(poolObject->heads[idx] + supoolCount) = NULL;
+            *(uint8_t**)(poolObject->heads[idx] + sumPoolCount) = NULL;
             return;
         }
     }
@@ -168,7 +168,7 @@ void pal_destroy (Palalloc* poolObject)
 {
     if (!poolObject->initialized) return;
 
-    for (int i = 0; i < poolObject->classCount; ++i)
+    for (int i = 0; i < poolObject->poolCount; ++i)
     {
         free(poolObject->pools[i]);
     }
@@ -188,7 +188,7 @@ void* pal_alloc (Palalloc* poolObject, uint32_t size)
 
     uint8_t *resPtr = NULL;
 
-    if (idx < poolObject->poolCount)
+    if (idx < poolObject->classCount)
     {
         if (size == poolObject->sizeClasses[idx])
         {
@@ -206,10 +206,10 @@ void* pal_alloc (Palalloc* poolObject, uint32_t size)
         }
         else
         {
-            ++poolObject->poolCount;
-            pal_ensurePoolCap(poolObject);
+            ++poolObject->classCount;
+            pal_ensureClassCap(poolObject);
 
-            for (int i = poolObject->poolCount - 1; i > idx; --i)
+            for (int i = poolObject->classCount - 1; i > idx; --i)
             {
                 poolObject->heads[i] = poolObject->heads[i - 1];
                 poolObject->sizeClasses[i] = poolObject->sizeClasses[i - 1];
@@ -220,8 +220,8 @@ void* pal_alloc (Palalloc* poolObject, uint32_t size)
     }
     else
     {
-        ++poolObject->poolCount;
-        pal_ensurePoolCap(poolObject);
+        ++poolObject->classCount;
+        pal_ensureClassCap(poolObject);
         
         pal_newPool(poolObject, &resPtr, size, idx);
     }
