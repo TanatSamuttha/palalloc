@@ -7,29 +7,63 @@ Instead of requiring a fixed set of size classes, Palalloc dynamically creates a
 ## Implementation Details
 
 * Memory is organized into separate pools for each supported allocation size.
+
 * Each pool contains blocks of the same size.
+
 * Free blocks are linked together using an intrusive singly linked list. The first bytes of each free block store a pointer to the next free block.
+
 * Free blocks are returned in **Last-In, First-Out (LIFO)** order.
+
 * Palalloc does not pre-create or pre-register size classes during initialization. Size classes are created dynamically when the first allocation of a particular size is requested.
+
 * Each newly created pool contains at least 4096 bytes and normally allocates space for 16 blocks:
 
   ```cpp
   poolSize = max(4096, size * 16);
   ```
-* When a new pool is created, all of its blocks are immediately linked into a free-list.
+
+* When a new pool is created, all of its blocks except the block immediately returned to the caller are linked into a free-list.
+
 * Allocation has several possible paths:
 
   1. **Fast path:** If a free block exists in the requested size class, remove the head of the free-list and return it.
   2. **Split path:** If no free block exists in the requested size class, Palalloc searches larger size classes. If a larger free block is available, it is split into the requested size.
   3. **New-pool path:** If no suitable larger free block exists, Palalloc creates a new pool for the requested size.
   4. **New-size-class path:** If the requested size does not exist among the current size classes, a new size class is inserted and a new pool is created for it.
-* Size classes are stored in ascending order.
+
+* Size classes stored in `heads` and `sizeClasses` are kept in ascending order.
+
 * When a new size class is inserted, the existing size-class metadata is shifted to preserve ordering.
-* The metadata arrays (`pools`, `heads`, and `sizeClasses`) grow dynamically when their capacity is exceeded.
-* `pal_alloc()` itself does **not** fall back to `std::malloc` for an allocation request. It creates a new pool instead.
+
+* The `pools` array stores pool pointers in pool creation order and is not shifted when a size class is inserted.
+
+* The metadata arrays grow dynamically when their corresponding capacity is exceeded.
+
 * The allocator does not store allocation metadata for individual pointers. Therefore, `pal_free()` requires the allocation size to identify the corresponding size class.
 
-### Free-list splitting
+### Minimum Allocation Size
+
+Palalloc does not support allocation sizes smaller than 8 bytes.
+
+Requests smaller than 8 bytes are automatically rounded up to 8 bytes:
+
+```cpp
+if (size < 8) size = 8;
+```
+
+Therefore:
+
+```cpp
+pal_alloc(&pool, 4);
+```
+
+allocates an 8-byte block, and `pal_free()` must use the effective size class:
+
+```cpp
+pal_free(&pool, ptr, 8);
+```
+
+## Free-list splitting
 
 When a requested size class has no available blocks, `pal_split()` iteratively searches for a larger size class by doubling the requested size on each iteration.
 
@@ -45,7 +79,7 @@ split
 
 The larger block is divided directly into multiple blocks of the requested size. The first block is returned to the caller, while the remaining blocks are linked together and assigned as the new free-list of the requested size class.
 
-This allows unused blocks from larger size classes to be reused for smaller allocations without recursively splitting through intermediate size classes.
+This allows unused blocks from larger size classes to be reused for smaller allocations.
 
 ## Initialization
 
@@ -73,7 +107,9 @@ If the requested size class already exists and has a free block, the head of its
 
 If no free block is available, Palalloc attempts to split a larger size class. If splitting is not possible, a new pool is allocated for the requested size.
 
-The returned memory is aligned according to the alignment provided by `malloc()` for the underlying pool allocation. However, Palalloc does not explicitly enforce alignment for individual block sizes.
+Requests smaller than 8 bytes are automatically rounded up to 8 bytes.
+
+The returned memory is obtained from memory allocated by `malloc()`. Palalloc does not explicitly enforce alignment for individual block sizes.
 
 ## Deallocation
 
@@ -83,7 +119,7 @@ Free memory using:
 pal_free(&pool, ptr, 256);
 ```
 
-The allocation size **must match the size class used when the block was allocated**.
+The allocation size **must match the effective size class used when the block was allocated**. In particular, allocations smaller than 8 bytes are rounded up to 8 bytes and must be freed using size `8`.
 
 The block is inserted at the head of the corresponding free-list:
 
@@ -140,11 +176,11 @@ a new size class is inserted:
 
 A new pool is then created specifically for 300-byte blocks.
 
-Therefore, Palalloc does **not** round unsupported allocation sizes to the nearest predefined size class.
+Therefore, Palalloc does **not** round unsupported allocation sizes to the nearest predefined size class, except that sizes below 8 bytes are rounded up to 8 bytes.
 
 ## Pool Management
 
-Each size class owns one pool:
+Each size class is associated with one newly created pool:
 
 ```text
 Size class 256
@@ -160,34 +196,40 @@ Size class 1024
     └── Free list
 ```
 
-The allocator stores three pieces of metadata for every size class:
+The allocator stores three pieces of metadata:
 
-| Metadata         | Description                              |
-| :--------------- | :--------------------------------------- |
-| `pools[i]`       | Beginning address of the memory pool     |
-| `heads[i]`       | Head of the free-list                    |
-| `sizeClasses[i]` | Block size represented by the size class |
+| Metadata         | Description                            |
+| :--------------- | :------------------------------------- |
+| `pools[i]`       | Beginning address of a memory pool     |
+| `heads[i]`       | Head of the free-list for a size class |
+| `sizeClasses[i]` | Block size represented by a size class |
+
+`heads` and `sizeClasses` are kept in ascending size-class order. `pools` stores pool pointers in the order in which pools were created.
 
 ## Dynamic Metadata Capacity
 
-The metadata arrays are dynamically resized when a new size class exceeds the current capacity.
+The metadata arrays are dynamically resized when more capacity is required.
 
-The initial capacity is:
+The initial capacities are:
 
 ```text
-1 size class
+poolCap  = 1
+classCap = 1
 ```
 
-When more capacity is required, the capacity is increased to the larger of:
+When more capacity is required, the corresponding capacity is increased to the larger of:
 
 ```text
-current size
+current count
 current capacity × 2
 ```
 
-This applies to:
+`poolCap` controls the storage for:
 
 * `pools`
+
+`classCap` controls the storage for:
+
 * `heads`
 * `sizeClasses`
 
@@ -204,22 +246,22 @@ to release all memory pools and metadata.
 `pal_destroy()`:
 
 1. Frees every memory pool.
-2. Frees the size-class metadata.
-3. Frees the free-list head metadata.
-4. Resets `mSize` and `mCap`.
+2. Frees the `pools` metadata.
+3. Frees the `sizeClasses` metadata.
+4. Frees the `heads` metadata.
 5. Marks the allocator as uninitialized.
 
 After calling `pal_destroy()`, all previously allocated pointers become dangling pointers.
 
 ## API Reference
 
-| Function                | Parameters                                          | Description                                                                                                          |
-| :---------------------- | :-------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------- |
-| `pal_create`            | `void`                                              | Creates a `Palalloc` object in an uninitialized state.                                                               |
-| `pal_init`              | `Palalloc* poolObject`                              | Initializes the allocator metadata. Memory pools are allocated lazily.                                               |
-| `pal_alloc`             | `Palalloc* poolObject, uint32_t size`               | Allocates a block of exactly the requested size. May reuse a free block, split a larger block, or create a new pool. |
-| `pal_free`              | `Palalloc* poolObject, void* memory, uint32_t size` | Returns a block to the free-list corresponding to the specified size.                                                |
-| `pal_destroy`           | `Palalloc* poolObject`                              | Frees all pools and metadata and marks the allocator as uninitialized.                                               |
+| Function      | Parameters                                          | Description                                                                                                                                        |
+| :------------ | :-------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pal_create`  | `void`                                              | Creates a `Palalloc` object in an uninitialized state.                                                                                             |
+| `pal_init`    | `Palalloc* poolObject`                              | Initializes the allocator metadata. Memory pools are allocated lazily.                                                                             |
+| `pal_alloc`   | `Palalloc* poolObject, uint32_t size`               | Allocates a block of the requested size, rounded up to 8 bytes when necessary. May reuse a free block, split a larger block, or create a new pool. |
+| `pal_free`    | `Palalloc* poolObject, void* memory, uint32_t size` | Returns a block to the free-list corresponding to the specified size class.                                                                        |
+| `pal_destroy` | `Palalloc* poolObject`                              | Frees all pools and metadata and marks the allocator as uninitialized.                                                                             |
 
 ## Utility Functions
 
@@ -244,37 +286,58 @@ Returns the larger of two `uint32_t` values.
 
 Returns the next power of two greater than or equal to the input.
 
+It can be used to round allocation sizes up to a power of two, which helps maintain consistent **alignment** and simplifies size-class management.
+
+For example:
+
+```text
+20 → 32
+33 → 64
+100 → 128
+```
+
 ### `pal_findIdx`
+
 (Internal use only)
 
-Searches the size-class array starting from a specified index and returns the index of the requested size class.
+Searches the size-class array starting from a specified index and returns the index of the requested size class or the end of the array if it is not found.
 
-### `pal_ensureCap`
+### `pal_ensurePoolCap`
+
 (Internal use only)
 
-Expands the metadata arrays when the number of size classes exceeds the current capacity.
+Expands the `heads` and `sizeClasses` arrays when their required capacity exceeds `poolCap`.
+
+### `pal_ensureClassCap`
+
+(Internal use only)
+
+Expands the `pools` array when its required capacity exceeds `classCap`.
 
 ### `pal_newPool`
+
 (Internal use only)
 
-Creates a new memory pool for a size class and links all blocks into its free-list.
+Creates a new memory pool for a size class and links the remaining blocks into its free-list.
 
 ### `pal_split`
+
 (Internal use only)
 
-Searches larger size classes and recursively splits a larger free block into blocks belonging to a smaller size class.
+Searches larger size classes and splits a larger free block directly into blocks belonging to a smaller size class.
 
 ## Important Limitations
 
 * `pal_free()` requires the caller to provide the allocation size.
+* Allocations smaller than 8 bytes are automatically rounded up to 8 bytes and must be freed using size `8`.
 * The allocator does not track whether a pointer has already been freed.
 * Invalid pointers and incorrect sizes result in undefined behavior.
-* `pal_alloc()` does not have a `malloc()` fallback. If memory allocation performed by the underlying `malloc()` fails, the behavior follows the normal `malloc()` failure semantics and the current implementation does not explicitly handle the failure.
+* `pal_alloc()` does not have a `malloc()` fallback. It creates a new pool when the requested allocation cannot be satisfied by an existing free block or a larger size class.
+* If the underlying `malloc()` call fails, `pal_alloc()` does not explicitly handle the failure.
 * There is no built-in tracking of allocations that are currently in use.
 * The allocator is **not thread-safe**. Each `Palalloc` instance should be accessed by only one thread at a time unless external synchronization is provided.
-* Pools are allocated using `std::malloc`/`malloc`, so the allocator itself depends on the system allocator for obtaining new pools.
+* Pools are allocated using `malloc()`, so the allocator itself depends on the system allocator for obtaining new pools.
 * The allocator is designed around exact requested sizes rather than a fixed predefined size-class table.
-* The allocator can not allocate data smaller than 8 bytes (size of pointer). It will automatically round to 8 bytes.
 * Pool memory is not returned to the system when individual blocks are freed. It is released only when `pal_destroy()` is called.
 
 ## Example
@@ -297,8 +360,8 @@ int main()
 
     printf("%d %d\n", *a, *b);
 
-    pal_free(&pool, a, sizeof(int));
-    pal_free(&pool, b, sizeof(int));
+    pal_free(&pool, a, 8);
+    pal_free(&pool, b, 8);
 
     pal_destroy(&pool);
 
@@ -308,12 +371,13 @@ int main()
 
 ## Design Philosophy
 
-Palalloc prioritizes **simple metadata, fast free-list operations, and reuse of recently freed memory** over the general-purpose flexibility of `std::malloc`.
+Palalloc prioritizes **simple metadata, fast free-list operations, and reuse of recently freed memory** over the general-purpose flexibility of `malloc`.
 
 The core design is based on three ideas:
-- Dynamic Size Classes
-- Intrusive LIFO Free Lists
-- Adaptive Block Splitting
+
+* Dynamic Size Classes
+* Intrusive LIFO Free Lists
+* Adaptive Block Splitting
 
 This makes Palalloc particularly suitable for workloads where allocation sizes are relatively predictable and where fast allocation/deallocation is more important than supporting arbitrary general-purpose allocation patterns.
 
@@ -338,7 +402,7 @@ Palalloc is benchmarked against the standard `malloc` allocator using the same s
 | **Palalloc** |    **19.07** |     **2.98× faster** |
 | `malloc`     |        59.02 |                1.00× |
 
-> **Result:** Palalloc achieves approximately **3.09× lower average execution time** than `malloc` for this workload.
+> **Result:** Palalloc achieves approximately **2.98× lower average execution time** than `malloc` for this workload.
 
 ---
 
